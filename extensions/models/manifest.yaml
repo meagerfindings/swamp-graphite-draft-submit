@@ -1,0 +1,27 @@
+manifestVersion: 1
+name: "@mgreten/graphite-draft-submit"
+version: "2026.07.20.1"
+description: >
+  Submit an already-validated Git commit as a draft GitHub pull request using
+  the Graphite CLI, then independently verify with the GitHub CLI that the pull
+  request points at the validated SHA, branch and base and is a draft.
+
+repository: https://github.com/meagerfindings/swamp-graphite-draft-submit
+
+models:
+  - graphite_draft_submit.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+labels:
+  - git
+  - graphite
+  - github
+  - pull-request
+  - ci
+
+platforms: []
+
+dependencies: []
