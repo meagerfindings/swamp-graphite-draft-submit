@@ -71,7 +71,10 @@ exit 0
   await Deno.writeTextFile(
     `${bin}/gh`,
     `#!/bin/sh
-printf '%s\\n' '${ghJson}'
+printf '%s\\n' "$*" >> '${root}/gh.log'
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\\n' '${ghJson}'
+fi
 `,
   );
   await Deno.chmod(`${bin}/gt`, 0o755);
@@ -159,6 +162,55 @@ Deno.test("shipDraft accepts a PR that matches the validated SHA, branch and bas
         "submit -q --no-edit --no-verify --no-stack --draft",
       ],
     );
+  } finally {
+    restorePath?.();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test("shipDraft applies a caller-supplied body via gh pr edit after gt submit", async () => {
+  const root = await Deno.makeTempDir();
+  let restorePath: (() => void) | undefined;
+  try {
+    const fixture = await repoFixture(root);
+    restorePath = await installShims(
+      root,
+      `{"url":"https://example.test/pr/9","number":9,"isDraft":true,"headRefName":"${fixture.branch}","headRefOid":"${fixture.baseSha}","baseRefName":"main"}`,
+    );
+    const test = createModelTestContext({ globalArgs: {} });
+    const body = "### Description\n\nHouse-style narrative.\n\n**Key Changes:**\n- one\n- two\n";
+
+    const result = await model.methods.shipDraft.execute({
+      workItem: "WORK-202",
+      repoPath: fixture.worktree,
+      baseBranch: "main",
+      expectedHeadSha: fixture.baseSha,
+      expectedBranch: fixture.branch,
+      draft: true,
+      body,
+    }, test.context);
+
+    assertEquals(result.dataHandles?.length, 1);
+    assertEquals(test.getWrittenResources()[0].data.success, true);
+
+    // gt submit succeeded, so the gh path is: pr edit (apply body) + pr view.
+    const ghCalls = (await Deno.readTextFile(`${root}/gh.log`))
+      .trim().split("\n");
+    const editCall = ghCalls.find((c) => c.startsWith("pr edit "));
+    if (!editCall) {
+      throw new Error(`expected a 'gh pr edit' call, saw: ${ghCalls.join(" | ")}`);
+    }
+    // Shape: pr edit <branch> --body-file <path>
+    const parts = editCall.split(/\s+/);
+    assertEquals(parts[0], "pr");
+    assertEquals(parts[1], "edit");
+    assertEquals(parts[2], fixture.branch);
+    assertEquals(parts[3], "--body-file");
+    const bodyFilePath = parts[4];
+    // The temp file is removed after the method returns, so assert the call
+    // shape and that no --fill was used for creation.
+    assertEquals(typeof bodyFilePath, "string");
+    assertEquals(ghCalls.some((c) => c.includes("--fill")), false);
   } finally {
     restorePath?.();
     await Deno.remove(root, { recursive: true });

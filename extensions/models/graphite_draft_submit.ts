@@ -204,6 +204,8 @@ export const ShipDraftArgsSchema: z.ZodObject<{
   expectedHeadSha: z.ZodString;
   expectedBranch: z.ZodString;
   draft: z.ZodDefault<z.ZodLiteral<true>>;
+  title: z.ZodOptional<z.ZodString>;
+  body: z.ZodOptional<z.ZodString>;
 }> = z.object({
   workItem: WorkItemSchema,
   repoPath: AbsolutePathSchema,
@@ -211,6 +213,15 @@ export const ShipDraftArgsSchema: z.ZodObject<{
   expectedHeadSha: CommitShaSchema,
   expectedBranch: z.string().min(1),
   draft: z.literal(true).default(true),
+  // Optional pull-request title and body. When `body` is provided, the caller
+  // owns the description (e.g. a house-style PR narrative generated upstream):
+  // the PR is opened with `--title`/`--body` instead of Graphite/gh `--fill`,
+  // and an already-open PR has its body refreshed via `gh pr edit`. When
+  // omitted, submission falls back to `--fill` (the commit message) exactly as
+  // before, so existing callers are unaffected. `title` defaults to the commit
+  // subject when only `body` is given.
+  title: z.string().min(1).optional(),
+  body: z.string().optional(),
 });
 
 /**
@@ -220,7 +231,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
  */
 export const model = {
   type: "@mgreten/graphite-draft-submit",
-  version: "2026.07.21.2",
+  version: "2026.07.21.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     pullRequest: {
@@ -270,6 +281,8 @@ export const model = {
           expectedHeadSha: string;
           expectedBranch: string;
           draft: true;
+          title?: string;
+          body?: string;
         },
         context: RuntimeContext,
       ): Promise<MethodResult> => {
@@ -306,6 +319,30 @@ export const model = {
         }
 
         const expectedBase = args.baseBranch.replace(/^origin\//, "");
+
+        // When the caller supplies a body, persist it to a temp file so it
+        // survives multi-line/markdown content without shell-quoting hazards,
+        // and resolve the title (explicit arg, else the commit subject). The
+        // file is best-effort cleaned up at the end of the method.
+        let bodyFile: string | null = null;
+        let prTitle: string | null = args.title ?? null;
+        if (args.body !== undefined) {
+          if (!prTitle) {
+            const subject = await runCommand(
+              ["git", "log", "-1", "--format=%s", args.expectedHeadSha],
+              args.repoPath,
+            );
+            prTitle = subject.success && subject.stdout
+              ? subject.stdout
+              : args.expectedBranch;
+          }
+          bodyFile = await Deno.makeTempFile({
+            prefix: `pr-body-${args.workItem}-`,
+            suffix: ".md",
+          });
+          await Deno.writeTextFile(bodyFile, args.body);
+        }
+
         const track = await runCommand(
           [
             "gt",
@@ -348,20 +385,23 @@ export const model = {
             args.repoPath,
           );
           if (push.success) {
-            ghFallback = await runCommand(
-              [
-                "gh",
-                "pr",
-                "create",
-                "--draft",
-                "--base",
-                expectedBase,
-                "--head",
-                branch,
-                "--fill",
-              ],
-              args.repoPath,
-            );
+            const createArgs = [
+              "gh",
+              "pr",
+              "create",
+              "--draft",
+              "--base",
+              expectedBase,
+              "--head",
+              branch,
+            ];
+            // Caller-supplied body wins; otherwise fall back to --fill (commit).
+            if (bodyFile && prTitle) {
+              createArgs.push("--title", prTitle, "--body-file", bodyFile);
+            } else {
+              createArgs.push("--fill");
+            }
+            ghFallback = await runCommand(createArgs, args.repoPath);
             // Idempotent: if a PR for this branch already exists (e.g. a prior
             // interrupted submit), that is not a failure — the `gh pr view`
             // verification below confirms the existing PR points at the exact
@@ -382,6 +422,33 @@ export const model = {
           }
         }
         const submitted = submit.success || ghFallback.success;
+
+        // Apply the caller-supplied body to the resulting PR whenever one was
+        // provided. This covers the `gt submit` path (which has no body option
+        // and would otherwise carry Graphite's --fill body) and the idempotent
+        // "already exists" case (whose PR may hold a stale/--fill body). The
+        // create path already set the body, so this is an idempotent refresh
+        // there. Best-effort: a failed edit does not fail submission, but is
+        // surfaced in the persisted summary below.
+        let bodyApplyError: string | null = null;
+        if (submitted && bodyFile) {
+          const edit = await runCommand(
+            ["gh", "pr", "edit", branch, "--body-file", bodyFile],
+            args.repoPath,
+          );
+          if (!edit.success) {
+            bodyApplyError = edit.stderr || edit.stdout;
+            context.logger.info(
+              "could not apply PR body for {workItem}: {error}",
+              { workItem: args.workItem, error: bodyApplyError },
+            );
+          }
+        }
+        if (bodyFile) {
+          try {
+            await Deno.remove(bodyFile);
+          } catch { /* best-effort cleanup */ }
+        }
 
         let prInfo: z.infer<typeof GitHubPullRequestSchema> | null = null;
         if (submitted) {
@@ -461,7 +528,10 @@ export const model = {
           baseBranch: expectedBase,
           commitSha: head.stdout,
           summary: errors.length === 0
-            ? `Draft PR #${prInfo?.number} submitted for ${branch}`
+            ? `Draft PR #${prInfo?.number} submitted for ${branch}` +
+              (bodyApplyError
+                ? ` (warning: PR body not applied: ${bodyApplyError})`
+                : "")
             : errors.join("; "),
           submittedAt: new Date().toISOString(),
         };
