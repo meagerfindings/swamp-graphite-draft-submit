@@ -216,3 +216,65 @@ Deno.test("shipDraft applies a caller-supplied body via gh pr edit after gt subm
     await Deno.remove(root, { recursive: true });
   }
 });
+
+Deno.test("shipDraft falls back to gh when gt track fails (local parent not in history)", async () => {
+  const root = await Deno.makeTempDir();
+  const previousPath = Deno.env.get("PATH");
+  try {
+    const fixture = await repoFixture(root);
+    const bin = `${root}/bin`;
+    await Deno.mkdir(bin);
+    // gt track FAILS (exit 1) — simulates the feature being rebased onto the
+    // REMOTE base while the local <base> branch diverged, so `gt track --parent
+    // <local>` reports "<base> is not in the history of <branch>".
+    await Deno.writeTextFile(
+      `${bin}/gt`,
+      `#!/bin/sh
+printf '%s\\n' "$*" >> '${root}/gt.log'
+if [ "$1" = "track" ]; then
+  echo "ERROR: main is not in the history of ${fixture.branch}." 1>&2
+  exit 1
+fi
+exit 0
+`,
+    );
+    // gh pr create succeeds; gh pr view returns the matching draft PR.
+    await Deno.writeTextFile(
+      `${bin}/gh`,
+      `#!/bin/sh
+printf '%s\\n' "$*" >> '${root}/gh.log'
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\\n' '{"url":"https://example.test/pr/12","number":12,"isDraft":true,"headRefName":"${fixture.branch}","headRefOid":"${fixture.baseSha}","baseRefName":"main"}'
+fi
+`,
+    );
+    await Deno.chmod(`${bin}/gt`, 0o755);
+    await Deno.chmod(`${bin}/gh`, 0o755);
+    Deno.env.set("PATH", `${bin}:${previousPath ?? ""}`);
+    const test = createModelTestContext({ globalArgs: {} });
+
+    const result = await model.methods.shipDraft.execute({
+      workItem: "WORK-203",
+      repoPath: fixture.worktree,
+      baseBranch: "main",
+      expectedHeadSha: fixture.baseSha,
+      expectedBranch: fixture.branch,
+      draft: true,
+    }, test.context);
+
+    // Despite gt track failing, the gh fallback created + verified the draft PR.
+    assertEquals(result.dataHandles?.length, 1);
+    const written = test.getWrittenResources();
+    assertEquals(written[0].data.success, true);
+    assertEquals(written[0].data.prNumber, 12);
+    const ghCalls = (await Deno.readTextFile(`${root}/gh.log`)).trim().split(
+      "\n",
+    );
+    assertEquals(ghCalls.some((c) => c.startsWith("pr create ")), true);
+  } finally {
+    previousPath === undefined
+      ? Deno.env.delete("PATH")
+      : Deno.env.set("PATH", previousPath);
+    await Deno.remove(root, { recursive: true });
+  }
+});

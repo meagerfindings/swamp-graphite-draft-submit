@@ -231,7 +231,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
  */
 export const model = {
   type: "@mgreten/graphite-draft-submit",
-  version: "2026.07.21.3",
+  version: "2026.07.21.4",
   globalArguments: GlobalArgsSchema,
   resources: {
     pullRequest: {
@@ -373,13 +373,20 @@ export const model = {
           ? await runCommand(submitCommand, args.repoPath)
           : { success: false, stdout: "", stderr: "" };
 
-        // Fallback: when gt cannot submit non-interactively (most commonly the
-        // "fetched-then-tracked parent" guard on a git-fetched base branch),
-        // create the draft PR directly with gh. This pushes ONLY this branch and
-        // opens a draft PR against the exact base — it never touches the parent
-        // branch. The gh pr view verification below then applies to either path.
+        // Fallback: when Graphite cannot submit non-interactively, create the
+        // draft PR directly with gh. This fires in TWO cases:
+        //   1. `gt track` succeeded but `gt submit` failed (the classic
+        //      "fetched-then-tracked parent" guard on a git-fetched base).
+        //   2. `gt track` FAILED because the local parent branch is not in the
+        //      feature's history — e.g. the feature was rebased onto the REMOTE
+        //      base (origin/<base>) while the local <base> branch diverged. gh
+        //      diffs against the remote `expectedBase` directly, so it does not
+        //      need Graphite's local-branch tracking at all.
+        // In both cases gh pushes ONLY this branch and opens a draft PR against
+        // the exact remote base — it never touches the parent branch. The gh pr
+        // view verification below then applies to either path.
         let ghFallback = { success: false, stderr: "", stdout: "" };
-        if (track.success && !submit.success) {
+        if (!submit.success) {
           const push = await runCommand(
             ["git", "push", "origin", `${branch}:${branch}`],
             args.repoPath,
@@ -480,11 +487,16 @@ export const model = {
         }
 
         const errors: string[] = [];
-        if (!track.success) {
-          errors.push(`gt track failed: ${track.stderr || track.stdout}`);
-        } else if (!submitted) {
+        // Only a failure to SUBMIT is an error. A failed `gt track` is not
+        // itself fatal when the gh fallback then created/verified the draft PR
+        // (submitted === true) — e.g. the feature was rebased onto the remote
+        // base while the local base branch diverged, so Graphite could not track
+        // the local parent but gh submits against the remote base fine.
+        if (!submitted) {
           errors.push(
-            `gt submit failed: ${submit.stderr || submit.stdout}` +
+            (track.success
+              ? `gt submit failed: ${submit.stderr || submit.stdout}`
+              : `gt track failed: ${track.stderr || track.stdout}`) +
               (ghFallback.stderr
                 ? ` (gh fallback also failed: ${ghFallback.stderr})`
                 : ""),
