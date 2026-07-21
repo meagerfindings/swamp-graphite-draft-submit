@@ -111,7 +111,7 @@ Deno.test("shipDraft rejects a PR whose headRefOid differs from the validated SH
       (await Deno.readTextFile(`${root}/gt.log`)).trim().split("\n"),
       [
         `track ${fixture.branch} --parent main --no-interactive`,
-        "submit -q --no-edit --no-verify --draft",
+        "submit -q --no-edit --no-verify --no-stack --draft",
       ],
     );
     assertEquals(test.getWrittenResources()[0].data.success, false);
@@ -156,7 +156,7 @@ Deno.test("shipDraft accepts a PR that matches the validated SHA, branch and bas
       (await Deno.readTextFile(`${root}/gt.log`)).trim().split("\n"),
       [
         `track ${fixture.branch} --parent main --no-interactive`,
-        "submit -q --no-edit --no-verify --draft",
+        "submit -q --no-edit --no-verify --no-stack --draft",
       ],
     );
   } finally {

@@ -220,7 +220,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
  */
 export const model = {
   type: "@mgreten/graphite-draft-submit",
-  version: "2026.07.20.1",
+  version: "2026.07.21.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     pullRequest: {
@@ -317,20 +317,63 @@ export const model = {
           ],
           args.repoPath,
         );
+        // `--no-stack` narrows the submit to THIS branch only: it does not
+        // submit (or force-push) the parent/ancestors. Critical when the parent
+        // was `git fetch`-ed rather than gt-created (e.g. stacking on an unmerged
+        // upstream branch): a plain `gt submit` defaults to `--stack`, which
+        // trips Graphite's "fetched-then-tracked" guard and, with `--force`,
+        // would overwrite the shared parent remote — never do that.
         const submitCommand = [
           "gt",
           "submit",
           "-q",
           "--no-edit",
           "--no-verify",
+          "--no-stack",
         ];
         submitCommand.push("--draft");
         const submit = track.success
           ? await runCommand(submitCommand, args.repoPath)
           : { success: false, stdout: "", stderr: "" };
 
+        // Fallback: when gt cannot submit non-interactively (most commonly the
+        // "fetched-then-tracked parent" guard on a git-fetched base branch),
+        // create the draft PR directly with gh. This pushes ONLY this branch and
+        // opens a draft PR against the exact base — it never touches the parent
+        // branch. The gh pr view verification below then applies to either path.
+        let ghFallback = { success: false, stderr: "", stdout: "" };
+        if (track.success && !submit.success) {
+          const push = await runCommand(
+            ["git", "push", "origin", `${branch}:${branch}`],
+            args.repoPath,
+          );
+          if (push.success) {
+            ghFallback = await runCommand(
+              [
+                "gh",
+                "pr",
+                "create",
+                "--draft",
+                "--base",
+                expectedBase,
+                "--head",
+                branch,
+                "--fill",
+              ],
+              args.repoPath,
+            );
+          } else {
+            ghFallback = {
+              success: false,
+              stderr: `git push failed: ${push.stderr}`,
+              stdout: "",
+            };
+          }
+        }
+        const submitted = submit.success || ghFallback.success;
+
         let prInfo: z.infer<typeof GitHubPullRequestSchema> | null = null;
-        if (submit.success) {
+        if (submitted) {
           for (let attempt = 0; attempt < 3 && !prInfo; attempt++) {
             if (attempt > 0) {
               await new Promise((resolve) => setTimeout(resolve, 1_000));
@@ -361,8 +404,13 @@ export const model = {
         const errors: string[] = [];
         if (!track.success) {
           errors.push(`gt track failed: ${track.stderr || track.stdout}`);
-        } else if (!submit.success) {
-          errors.push(`gt submit failed: ${submit.stderr || submit.stdout}`);
+        } else if (!submitted) {
+          errors.push(
+            `gt submit failed: ${submit.stderr || submit.stdout}` +
+              (ghFallback.stderr
+                ? ` (gh fallback also failed: ${ghFallback.stderr})`
+                : ""),
+          );
         }
         if (!prInfo) {
           errors.push("GitHub did not return a pull request for the branch");

@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/graphite-draft-submit"
-version: "2026.07.20.1"
+version: "2026.07.21.1"
 description: >
   Submit an already-validated Git commit as a draft GitHub pull request using
   the Graphite CLI, then independently verify with the GitHub CLI that the pull
