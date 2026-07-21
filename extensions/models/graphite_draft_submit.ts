@@ -220,7 +220,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
  */
 export const model = {
   type: "@mgreten/graphite-draft-submit",
-  version: "2026.07.21.1",
+  version: "2026.07.21.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     pullRequest: {
@@ -362,6 +362,17 @@ export const model = {
               ],
               args.repoPath,
             );
+            // Idempotent: if a PR for this branch already exists (e.g. a prior
+            // interrupted submit), that is not a failure — the `gh pr view`
+            // verification below confirms the existing PR points at the exact
+            // validated SHA/base and is a draft. Treat "already exists" as
+            // submitted.
+            if (
+              !ghFallback.success &&
+              /already exists/i.test(ghFallback.stderr + ghFallback.stdout)
+            ) {
+              ghFallback = { success: true, stderr: "", stdout: "" };
+            }
           } else {
             ghFallback = {
               success: false,
