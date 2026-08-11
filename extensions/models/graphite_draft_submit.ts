@@ -96,6 +96,8 @@ export const PullRequestSchema: z.ZodObject<{
   draft: z.ZodLiteral<true>;
   prUrl: z.ZodOptional<z.ZodString>;
   prNumber: z.ZodOptional<z.ZodNumber>;
+  url: z.ZodOptional<z.ZodString>;
+  number: z.ZodOptional<z.ZodNumber>;
   branch: z.ZodString;
   baseBranch: z.ZodString;
   commitSha: z.ZodString;
@@ -107,6 +109,8 @@ export const PullRequestSchema: z.ZodObject<{
   draft: z.literal(true),
   prUrl: z.string().optional(),
   prNumber: z.number().int().optional(),
+  url: z.string().optional(),
+  number: z.number().int().optional(),
   branch: z.string(),
   baseBranch: z.string(),
   commitSha: z.string(),
@@ -121,6 +125,7 @@ export const PullRequestSchema: z.ZodObject<{
 export const GitHubPullRequestSchema: z.ZodObject<{
   url: z.ZodString;
   number: z.ZodNumber;
+  state: z.ZodLiteral<"OPEN">;
   isDraft: z.ZodBoolean;
   headRefName: z.ZodString;
   headRefOid: z.ZodString;
@@ -128,10 +133,11 @@ export const GitHubPullRequestSchema: z.ZodObject<{
 }> = z.object({
   url: z.string().url(),
   number: z.number().int().positive(),
+  state: z.literal("OPEN"),
   isDraft: z.boolean(),
-  headRefName: z.string(),
-  headRefOid: z.string(),
-  baseRefName: z.string(),
+  headRefName: z.string().min(1),
+  headRefOid: CommitShaSchema,
+  baseRefName: z.string().min(1),
 });
 
 /** The result of running a single external command via {@link runCommand}. */
@@ -196,6 +202,29 @@ export async function commandAvailable(name: string): Promise<boolean> {
   return false;
 }
 
+/**
+ * Create and populate the temporary PR body file, removing it if population
+ * fails after creation. The writer parameter is a narrow test seam for the
+ * otherwise hard-to-inject OS write failure between those two operations.
+ */
+export async function writeTemporaryBodyFile(
+  workItem: string,
+  body: string,
+  write: (path: string, body: string) => Promise<void> = Deno.writeTextFile,
+): Promise<string> {
+  const path = await Deno.makeTempFile({
+    prefix: `pr-body-${workItem}-`,
+    suffix: ".md",
+  });
+  try {
+    await write(path, body);
+    return path;
+  } catch (error) {
+    await Deno.remove(path).catch(() => undefined);
+    throw error;
+  }
+}
+
 /** Arguments accepted by the {@link model}'s `shipDraft` method. */
 export const ShipDraftArgsSchema: z.ZodObject<{
   workItem: z.ZodString;
@@ -203,6 +232,9 @@ export const ShipDraftArgsSchema: z.ZodObject<{
   baseBranch: z.ZodDefault<z.ZodString>;
   expectedHeadSha: z.ZodString;
   expectedBranch: z.ZodString;
+  submissionMode: z.ZodDefault<
+    z.ZodEnum<{ create: "create"; update: "update" }>
+  >;
   draft: z.ZodDefault<z.ZodLiteral<true>>;
   title: z.ZodOptional<z.ZodString>;
   body: z.ZodOptional<z.ZodString>;
@@ -212,6 +244,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
   baseBranch: z.string().min(1).default("main"),
   expectedHeadSha: CommitShaSchema,
   expectedBranch: z.string().min(1),
+  submissionMode: z.enum(["create", "update"]).default("create"),
   draft: z.literal(true).default(true),
   // Optional pull-request title and body. When `body` is provided, the caller
   // owns the description (e.g. a house-style PR narrative generated upstream):
@@ -231,7 +264,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
  */
 export const model = {
   type: "@mgreten/graphite-draft-submit",
-  version: "2026.07.21.4",
+  version: "2026.08.11.1",
   globalArguments: GlobalArgsSchema,
   resources: {
     pullRequest: {
@@ -253,12 +286,12 @@ export const model = {
     },
     "submission-tools-available": {
       description:
-        "Verify Graphite and GitHub CLIs are available before submission",
+        "Verify the shared GitHub CLI dependency before submission; create mode checks Graphite immediately before its create path",
       labels: ["dependency"],
       appliesTo: ["shipDraft"],
       execute: async (): Promise<{ pass: boolean; errors?: string[] }> => {
         const missing: string[] = [];
-        for (const command of ["gt", "gh"]) {
+        for (const command of ["gh"]) {
           if (!await commandAvailable(command)) missing.push(command);
         }
         return missing.length === 0 ? { pass: true } : {
@@ -280,6 +313,7 @@ export const model = {
           baseBranch: string;
           expectedHeadSha: string;
           expectedBranch: string;
+          submissionMode?: "create" | "update";
           draft: true;
           title?: string;
           body?: string;
@@ -289,6 +323,7 @@ export const model = {
         context.logger.info("Preparing draft submission for {workItem}", {
           workItem: args.workItem,
         });
+        const submissionMode = args.submissionMode ?? "create";
         const branchResult = await runCommand(
           ["git", "rev-parse", "--abbrev-ref", "HEAD"],
           args.repoPath,
@@ -301,6 +336,13 @@ export const model = {
           throw new Error(
             `refusing to submit ${branch}; expected ${args.expectedBranch}`,
           );
+        }
+        const validBranch = await runCommand(
+          ["git", "check-ref-format", "--branch", branch],
+          args.repoPath,
+        );
+        if (!validBranch.success) {
+          throw new Error(`refusing to submit invalid branch ${branch}`);
         }
 
         const status = await runCommand(
@@ -319,6 +361,22 @@ export const model = {
         }
 
         const expectedBase = args.baseBranch.replace(/^origin\//, "");
+        const validBase = await runCommand(
+          ["git", "check-ref-format", "--branch", expectedBase],
+          args.repoPath,
+        );
+        if (!validBase.success) {
+          throw new Error(
+            `refusing to submit invalid base branch ${expectedBase}`,
+          );
+        }
+
+        // Update mode deliberately has no Graphite dependency. Create mode
+        // checks its conditional dependency before allocating temporary files
+        // or performing any submission side effect.
+        if (submissionMode === "create" && !await commandAvailable("gt")) {
+          throw new Error("Missing required tool for create mode: gt");
+        }
 
         // When the caller supplies a body, persist it to a temp file so it
         // survives multi-line/markdown content without shell-quoting hazards,
@@ -336,232 +394,311 @@ export const model = {
               ? subject.stdout
               : args.expectedBranch;
           }
-          bodyFile = await Deno.makeTempFile({
-            prefix: `pr-body-${args.workItem}-`,
-            suffix: ".md",
-          });
-          await Deno.writeTextFile(bodyFile, args.body);
+          bodyFile = await writeTemporaryBodyFile(args.workItem, args.body);
         }
 
-        const track = await runCommand(
-          [
-            "gt",
-            "track",
-            branch,
-            "--parent",
-            expectedBase,
-            "--no-interactive",
-          ],
-          args.repoPath,
-        );
-        // `--no-stack` narrows the submit to THIS branch only: it does not
-        // submit (or force-push) the parent/ancestors. Critical when the parent
-        // was `git fetch`-ed rather than gt-created (e.g. stacking on an unmerged
-        // upstream branch): a plain `gt submit` defaults to `--stack`, which
-        // trips Graphite's "fetched-then-tracked" guard and, with `--force`,
-        // would overwrite the shared parent remote — never do that.
-        const submitCommand = [
-          "gt",
-          "submit",
-          "-q",
-          "--no-edit",
-          "--no-verify",
-          "--no-stack",
-        ];
-        submitCommand.push("--draft");
-        const submit = track.success
-          ? await runCommand(submitCommand, args.repoPath)
-          : { success: false, stdout: "", stderr: "" };
-
-        // Fallback: when Graphite cannot submit non-interactively, create the
-        // draft PR directly with gh. This fires in TWO cases:
-        //   1. `gt track` succeeded but `gt submit` failed (the classic
-        //      "fetched-then-tracked parent" guard on a git-fetched base).
-        //   2. `gt track` FAILED because the local parent branch is not in the
-        //      feature's history — e.g. the feature was rebased onto the REMOTE
-        //      base (origin/<base>) while the local <base> branch diverged. gh
-        //      diffs against the remote `expectedBase` directly, so it does not
-        //      need Graphite's local-branch tracking at all.
-        // In both cases gh pushes ONLY this branch and opens a draft PR against
-        // the exact remote base — it never touches the parent branch. The gh pr
-        // view verification below then applies to either path.
-        let ghFallback = { success: false, stderr: "", stdout: "" };
-        if (!submit.success) {
-          const push = await runCommand(
-            ["git", "push", "origin", `${branch}:${branch}`],
-            args.repoPath,
-          );
-          if (push.success) {
-            const createArgs = [
-              "gh",
-              "pr",
-              "create",
-              "--draft",
-              "--base",
-              expectedBase,
-              "--head",
-              branch,
-            ];
-            // Caller-supplied body wins; otherwise fall back to --fill (commit).
-            if (bodyFile && prTitle) {
-              createArgs.push("--title", prTitle, "--body-file", bodyFile);
-            } else {
-              createArgs.push("--fill");
-            }
-            ghFallback = await runCommand(createArgs, args.repoPath);
-            // Idempotent: if a PR for this branch already exists (e.g. a prior
-            // interrupted submit), that is not a failure — the `gh pr view`
-            // verification below confirms the existing PR points at the exact
-            // validated SHA/base and is a draft. Treat "already exists" as
-            // submitted.
-            if (
-              !ghFallback.success &&
-              /already exists/i.test(ghFallback.stderr + ghFallback.stdout)
-            ) {
-              ghFallback = { success: true, stderr: "", stdout: "" };
-            }
-          } else {
-            ghFallback = {
-              success: false,
-              stderr: `git push failed: ${push.stderr}`,
-              stdout: "",
-            };
-          }
-        }
-        const submitted = submit.success || ghFallback.success;
-
-        // Apply the caller-supplied body to the resulting PR whenever one was
-        // provided. This covers the `gt submit` path (which has no body option
-        // and would otherwise carry Graphite's --fill body) and the idempotent
-        // "already exists" case (whose PR may hold a stale/--fill body). The
-        // create path already set the body, so this is an idempotent refresh
-        // there. Best-effort: a failed edit does not fail submission, but is
-        // surfaced in the persisted summary below.
-        let bodyApplyError: string | null = null;
-        if (submitted && bodyFile) {
-          const edit = await runCommand(
-            ["gh", "pr", "edit", branch, "--body-file", bodyFile],
-            args.repoPath,
-          );
-          if (!edit.success) {
-            bodyApplyError = edit.stderr || edit.stdout;
-            context.logger.info(
-              "could not apply PR body for {workItem}: {error}",
-              { workItem: args.workItem, error: bodyApplyError },
-            );
-          }
-        }
-        if (bodyFile) {
-          try {
-            await Deno.remove(bodyFile);
-          } catch { /* best-effort cleanup */ }
-        }
-
-        let prInfo: z.infer<typeof GitHubPullRequestSchema> | null = null;
-        if (submitted) {
-          for (let attempt = 0; attempt < 3 && !prInfo; attempt++) {
-            if (attempt > 0) {
-              await new Promise((resolve) => setTimeout(resolve, 1_000));
-            }
+        try {
+          let updatePr: z.infer<typeof GitHubPullRequestSchema> | null = null;
+          if (submissionMode === "update") {
             const view = await runCommand(
               [
                 "gh",
                 "pr",
                 "view",
+                branch,
                 "--json",
-                "url,number,isDraft,headRefName,headRefOid,baseRefName",
+                "url,number,state,isDraft,headRefName,headRefOid,baseRefName",
               ],
               args.repoPath,
             );
-            if (view.success) {
-              try {
-                const parsed = GitHubPullRequestSchema.safeParse(
-                  JSON.parse(view.stdout),
+            if (!view.success) {
+              throw new Error(
+                "GitHub did not return the existing pull request for the branch",
+              );
+            }
+            let raw: unknown;
+            try {
+              raw = JSON.parse(view.stdout);
+            } catch {
+              throw new Error(
+                "GitHub returned malformed existing pull request data",
+              );
+            }
+            const parsed = GitHubPullRequestSchema.safeParse(raw);
+            if (!parsed.success) {
+              throw new Error(
+                "existing pull request is not open or has malformed data",
+              );
+            }
+            updatePr = parsed.data;
+            if (!updatePr.isDraft) {
+              throw new Error("existing pull request is not a draft");
+            }
+            if (updatePr.headRefName !== branch) {
+              throw new Error(
+                `existing pull request head is ${updatePr.headRefName}, expected ${branch}`,
+              );
+            }
+            if (updatePr.baseRefName !== expectedBase) {
+              throw new Error(
+                `existing pull request base is ${updatePr.baseRefName}, expected ${expectedBase}`,
+              );
+            }
+          }
+
+          const track = submissionMode === "create"
+            ? await runCommand(
+              [
+                "gt",
+                "track",
+                branch,
+                "--parent",
+                expectedBase,
+                "--no-interactive",
+              ],
+              args.repoPath,
+            )
+            : { success: false, stdout: "", stderr: "", code: 1 };
+          // `--no-stack` narrows the submit to THIS branch only: it does not
+          // submit (or force-push) the parent/ancestors. Critical when the parent
+          // was `git fetch`-ed rather than gt-created (e.g. stacking on an unmerged
+          // upstream branch): a plain `gt submit` defaults to `--stack`, which
+          // trips Graphite's "fetched-then-tracked" guard and, with `--force`,
+          // would overwrite the shared parent remote — never do that.
+          const submitCommand = [
+            "gt",
+            "submit",
+            "-q",
+            "--no-edit",
+            "--no-verify",
+            "--no-stack",
+          ];
+          submitCommand.push("--draft");
+          const submit = submissionMode === "create" && track.success
+            ? await runCommand(submitCommand, args.repoPath)
+            : { success: false, stdout: "", stderr: "" };
+
+          // Fallback: when Graphite cannot submit non-interactively, create the
+          // draft PR directly with gh. This fires in TWO cases:
+          //   1. `gt track` succeeded but `gt submit` failed (the classic
+          //      "fetched-then-tracked parent" guard on a git-fetched base).
+          //   2. `gt track` FAILED because the local parent branch is not in the
+          //      feature's history — e.g. the feature was rebased onto the REMOTE
+          //      base (origin/<base>) while the local <base> branch diverged. gh
+          //      diffs against the remote `expectedBase` directly, so it does not
+          //      need Graphite's local-branch tracking at all.
+          // In both cases gh pushes ONLY this branch and opens a draft PR against
+          // the exact remote base — it never touches the parent branch. The gh pr
+          // view verification below then applies to either path.
+          let ghFallback = { success: false, stderr: "", stdout: "" };
+          if (submissionMode === "update") {
+            if (updatePr!.headRefOid !== args.expectedHeadSha) {
+              const push = await runCommand([
+                "git",
+                "push",
+                `--force-with-lease=refs/heads/${branch}:${
+                  updatePr!.headRefOid
+                }`,
+                "origin",
+                `refs/heads/${branch}:refs/heads/${branch}`,
+              ], args.repoPath);
+              if (!push.success) {
+                throw new Error(
+                  `git push failed: ${push.stderr || push.stdout}`,
                 );
-                if (parsed.success) prInfo = parsed.data;
-              } catch {
-                prInfo = null;
+              }
+            }
+            ghFallback = { success: true, stderr: "", stdout: "" };
+          } else if (!submit.success) {
+            const pushArgs = ["git", "push", "origin", `${branch}:${branch}`];
+            const push = await runCommand(
+              pushArgs,
+              args.repoPath,
+            );
+            if (push.success) {
+              const createArgs = [
+                "gh",
+                "pr",
+                "create",
+                "--draft",
+                "--base",
+                expectedBase,
+                "--head",
+                branch,
+              ];
+              // Caller-supplied body wins; otherwise fall back to --fill (commit).
+              if (bodyFile && prTitle) {
+                createArgs.push("--title", prTitle, "--body-file", bodyFile);
+              } else {
+                createArgs.push("--fill");
+              }
+              ghFallback = await runCommand(createArgs, args.repoPath);
+              // Idempotent: if a PR for this branch already exists (e.g. a prior
+              // interrupted submit), that is not a failure — the `gh pr view`
+              // verification below confirms the existing PR points at the exact
+              // validated SHA/base and is a draft. Treat "already exists" as
+              // submitted.
+              if (
+                !ghFallback.success &&
+                /already exists/i.test(ghFallback.stderr + ghFallback.stdout)
+              ) {
+                ghFallback = { success: true, stderr: "", stdout: "" };
+              }
+            } else {
+              ghFallback = {
+                success: false,
+                stderr: `git push failed: ${push.stderr}`,
+                stdout: "",
+              };
+            }
+          }
+          const submitted = submit.success || ghFallback.success;
+          const prSelector = updatePr ? String(updatePr.number) : branch;
+
+          // Apply the caller-supplied body to the resulting PR whenever one was
+          // provided. This covers the `gt submit` path (which has no body option
+          // and would otherwise carry Graphite's --fill body) and the idempotent
+          // "already exists" case (whose PR may hold a stale/--fill body). The
+          // create path already set the body, so this is an idempotent refresh
+          // there. Best-effort: a failed edit does not fail submission, but is
+          // surfaced in the persisted summary below.
+          let bodyApplyError: string | null = null;
+          if (submitted && bodyFile) {
+            const edit = await runCommand(
+              ["gh", "pr", "edit", prSelector, "--body-file", bodyFile],
+              args.repoPath,
+            );
+            if (!edit.success) {
+              bodyApplyError = edit.stderr || edit.stdout;
+              context.logger.info(
+                "could not apply PR body for {workItem}: {error}",
+                { workItem: args.workItem, error: bodyApplyError },
+              );
+            }
+          }
+          let prInfo: z.infer<typeof GitHubPullRequestSchema> | null = null;
+          if (submitted) {
+            for (let attempt = 0; attempt < 3 && !prInfo; attempt++) {
+              if (attempt > 0) {
+                await new Promise((resolve) => setTimeout(resolve, 1_000));
+              }
+              const view = await runCommand(
+                [
+                  "gh",
+                  "pr",
+                  "view",
+                  prSelector,
+                  "--json",
+                  "url,number,state,isDraft,headRefName,headRefOid,baseRefName",
+                ],
+                args.repoPath,
+              );
+              if (view.success) {
+                try {
+                  const parsed = GitHubPullRequestSchema.safeParse(
+                    JSON.parse(view.stdout),
+                  );
+                  if (parsed.success) prInfo = parsed.data;
+                } catch {
+                  prInfo = null;
+                }
               }
             }
           }
-        }
 
-        const errors: string[] = [];
-        // Only a failure to SUBMIT is an error. A failed `gt track` is not
-        // itself fatal when the gh fallback then created/verified the draft PR
-        // (submitted === true) — e.g. the feature was rebased onto the remote
-        // base while the local base branch diverged, so Graphite could not track
-        // the local parent but gh submits against the remote base fine.
-        if (!submitted) {
-          errors.push(
-            (track.success
-              ? `gt submit failed: ${submit.stderr || submit.stdout}`
-              : `gt track failed: ${track.stderr || track.stdout}`) +
-              (ghFallback.stderr
-                ? ` (gh fallback also failed: ${ghFallback.stderr})`
-                : ""),
-          );
-        }
-        if (!prInfo) {
-          errors.push("GitHub did not return a pull request for the branch");
-        }
-        if (
-          prInfo?.headRefName !== undefined && prInfo.headRefName !== branch
-        ) {
-          errors.push(
-            `pull request head is ${prInfo.headRefName}, expected ${branch}`,
-          );
-        }
-        if (
-          prInfo?.headRefOid !== undefined &&
-          prInfo.headRefOid !== args.expectedHeadSha
-        ) {
-          errors.push("pull request does not point at the validated commit");
-        }
-        if (
-          prInfo?.baseRefName !== undefined &&
-          prInfo.baseRefName !== expectedBase
-        ) {
-          errors.push(
-            `pull request base is ${prInfo.baseRefName}, expected ${expectedBase}`,
-          );
-        }
-        if (prInfo?.isDraft !== true) {
-          errors.push("pull request is not a draft");
-        }
+          const errors: string[] = [];
+          if (bodyApplyError && submissionMode === "update") {
+            errors.push(`could not apply PR body: ${bodyApplyError}`);
+          }
+          // Only a failure to SUBMIT is an error. A failed `gt track` is not
+          // itself fatal when the gh fallback then created/verified the draft PR
+          // (submitted === true) — e.g. the feature was rebased onto the remote
+          // base while the local base branch diverged, so Graphite could not track
+          // the local parent but gh submits against the remote base fine.
+          if (!submitted) {
+            errors.push(
+              (track.success
+                ? `gt submit failed: ${submit.stderr || submit.stdout}`
+                : `gt track failed: ${track.stderr || track.stdout}`) +
+                (ghFallback.stderr
+                  ? ` (gh fallback also failed: ${ghFallback.stderr})`
+                  : ""),
+            );
+          }
+          if (!prInfo) {
+            errors.push("GitHub did not return a pull request for the branch");
+          }
+          if (updatePr && prInfo && prInfo.number !== updatePr.number) {
+            errors.push(
+              `pull request number changed from ${updatePr.number} to ${prInfo.number}`,
+            );
+          }
+          if (
+            prInfo?.headRefName !== undefined && prInfo.headRefName !== branch
+          ) {
+            errors.push(
+              `pull request head is ${prInfo.headRefName}, expected ${branch}`,
+            );
+          }
+          if (
+            prInfo?.headRefOid !== undefined &&
+            prInfo.headRefOid !== args.expectedHeadSha
+          ) {
+            errors.push("pull request does not point at the validated commit");
+          }
+          if (
+            prInfo?.baseRefName !== undefined &&
+            prInfo.baseRefName !== expectedBase
+          ) {
+            errors.push(
+              `pull request base is ${prInfo.baseRefName}, expected ${expectedBase}`,
+            );
+          }
+          if (prInfo?.isDraft !== true) {
+            errors.push("pull request is not a draft");
+          }
 
-        const pullRequest = {
-          workItem: args.workItem,
-          success: errors.length === 0,
-          draft: true as const,
-          prUrl: prInfo?.url,
-          prNumber: prInfo?.number,
-          branch,
-          baseBranch: expectedBase,
-          commitSha: head.stdout,
-          summary: errors.length === 0
-            ? `Draft PR #${prInfo?.number} submitted for ${branch}` +
-              (bodyApplyError
-                ? ` (warning: PR body not applied: ${bodyApplyError})`
-                : "")
-            : errors.join("; "),
-          submittedAt: new Date().toISOString(),
-        };
-        const handle = await context.writeResource(
-          "pullRequest",
-          `pull-request-${args.workItem}`,
-          pullRequest,
-          {
-            tags: {
-              workItem: args.workItem,
-              success: String(pullRequest.success),
+          const pullRequest = {
+            workItem: args.workItem,
+            success: errors.length === 0,
+            draft: true as const,
+            prUrl: prInfo?.url,
+            prNumber: prInfo?.number,
+            url: prInfo?.url,
+            number: prInfo?.number,
+            branch,
+            baseBranch: expectedBase,
+            commitSha: head.stdout,
+            summary: errors.length === 0
+              ? `Draft PR #${prInfo?.number} submitted for ${branch}` +
+                (bodyApplyError
+                  ? ` (warning: PR body not applied: ${bodyApplyError})`
+                  : "")
+              : errors.join("; "),
+            submittedAt: new Date().toISOString(),
+          };
+          const handle = await context.writeResource(
+            "pullRequest",
+            `pull-request-${args.workItem}`,
+            pullRequest,
+            {
+              tags: {
+                workItem: args.workItem,
+                success: String(pullRequest.success),
+              },
             },
-          },
-        );
-        if (errors.length > 0) throw new Error(pullRequest.summary);
+          );
+          if (errors.length > 0) throw new Error(pullRequest.summary);
 
-        context.logger.info("Submitted {url}", { url: prInfo?.url });
-        return { dataHandles: [handle] };
+          context.logger.info("Submitted {url}", { url: prInfo?.url });
+          return { dataHandles: [handle] };
+        } finally {
+          if (bodyFile) {
+            try {
+              await Deno.remove(bodyFile);
+            } catch { /* best-effort cleanup */ }
+          }
+        }
       },
     },
   },
