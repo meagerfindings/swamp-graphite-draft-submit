@@ -1,14 +1,15 @@
 # @mgreten/graphite-draft-submit
 
 A [swamp](https://swamp.club) model that submits an already-validated Git commit
-as a **draft** GitHub pull request using the [Graphite](https://graphite.dev)
-CLI (`gt`), then independently verifies the result with the GitHub CLI (`gh`).
+as a **draft** GitHub pull request (`git push` + `gh pr create --draft`), then
+independently verifies the result with the GitHub CLI (`gh`). It does not use
+Graphite; the type keeps its historical name so existing instances stay valid.
 
 The model is deliberately conservative. It never touches the working tree,
 never amends or rewrites the commit, and refuses to submit unless the checkout
 matches exactly what you say you validated: the current branch must equal
 `expectedBranch` (no detached HEAD), the worktree must be clean, and `HEAD` must
-equal `expectedHeadSha`. After `gt track` + `gt submit --draft` it queries
+equal `expectedHeadSha`. After pushing the branch and opening the draft PR it queries
 `gh pr view` and requires the returned pull request to point at the validated
 SHA, branch and base, and to be a draft. Any mismatch is recorded on the
 persisted `pullRequest` resource with `success: false` and the method throws, so
@@ -59,8 +60,8 @@ This model declares no global arguments.
 
 ## Method: shipDraft
 
-Submits an unchanged validated commit through Graphite and requires a
-discoverable draft GitHub pull request.
+Pushes an unchanged validated commit, opens (or reuses) a draft GitHub pull
+request, and requires it to be discoverable.
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
@@ -82,8 +83,9 @@ summary explaining every mismatch, then throws.
    and the checkout is not detached.
 2. `git status --porcelain --untracked-files=all` — refuse a dirty worktree.
 3. `git rev-parse HEAD` — refuse a commit that differs from `expectedHeadSha`.
-4. `gt track <branch> --parent <baseBranch> --no-interactive` then
-   `gt submit -q --no-edit --no-verify --draft`.
+4. `git push origin <branch>:<branch>` (this branch only, never its parent), then
+   `gh pr create --draft --base <baseBranch> --head <branch>` with the caller's
+   title and body or `--fill`. An existing PR for the branch is reused.
 5. `gh pr view --json url,number,isDraft,headRefName,headRefOid,baseRefName`
    inside a three-attempt retry with a one-second backoff, to tolerate the short
    delay before GitHub reports the new pull request.
@@ -92,8 +94,8 @@ summary explaining every mismatch, then throws.
    branch and base — otherwise the record is marked `success: false` and the
    method throws.
 
-Prerequisites on the host running the method: `git`, `gt` (Graphite) and `gh`
-(GitHub CLI, authenticated) must all be on `PATH`. The model declares these as
+Prerequisites on the host running the method: `git` and `gh` (GitHub CLI,
+authenticated) must be on `PATH`. The model declares these as
 `git-available` and `submission-tools-available` checks.
 
 ## License

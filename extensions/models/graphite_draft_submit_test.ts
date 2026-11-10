@@ -55,8 +55,9 @@ async function repoFixture(root: string): Promise<{
 
 /**
  * Write executable `gt` and `gh` shims into `${root}/bin` and prepend that dir
- * to PATH. `gt` appends its argv to `${root}/gt.log` and exits 0; `gh` prints
- * the supplied fixed PR JSON. Returns a restore function for PATH.
+ * to PATH. `gt` appends its argv to `${root}/gt.log` and fails, so any Graphite
+ * call shows up in the log; `gh` logs its argv and prints the supplied fixed PR
+ * JSON for `pr view`. Returns a restore function for PATH.
  */
 async function installShims(
   root: string,
@@ -69,7 +70,7 @@ async function installShims(
     `${bin}/gt`,
     `#!/bin/sh
 printf '%s\\n' "$*" >> '${root}/gt.log'
-exit 0
+exit 1
 `,
   );
   await Deno.writeTextFile(
@@ -88,6 +89,32 @@ fi
     previousPath === undefined
       ? Deno.env.delete("PATH")
       : Deno.env.set("PATH", previousPath);
+}
+
+/** Assert the create path pushed the branch, opened a draft PR with gh, and never called gt. */
+async function assertCreatedWithGh(
+  root: string,
+  fixture: { worktree: string; branch: string; baseSha: string },
+): Promise<string[]> {
+  assertEquals(await Deno.readTextFile(`${root}/gt.log`).catch(() => ""), "");
+  const remote = await git(
+    fixture.worktree,
+    "ls-remote",
+    "--heads",
+    "origin",
+    `refs/heads/${fixture.branch}`,
+  );
+  assertEquals(remote.split(/\s+/)[0], fixture.baseSha);
+  const ghCalls = (await Deno.readTextFile(`${root}/gh.log`)).trim().split(
+    "\n",
+  );
+  assertEquals(
+    ghCalls.some((c) =>
+      c.startsWith(`pr create --draft --base main --head ${fixture.branch}`)
+    ),
+    true,
+  );
+  return ghCalls;
 }
 
 /** Execute the model-level preflight checks that apply to shipDraft. */
@@ -141,13 +168,7 @@ Deno.test("shipDraft rejects a PR whose headRefOid differs from the validated SH
       Error,
       "pull request does not point at the validated commit",
     );
-    assertEquals(
-      (await Deno.readTextFile(`${root}/gt.log`)).trim().split("\n"),
-      [
-        `track ${fixture.branch} --parent main --no-interactive`,
-        "submit -q --no-edit --no-verify --no-stack --draft",
-      ],
-    );
+    await assertCreatedWithGh(root, fixture);
     assertEquals(test.getWrittenResources()[0].data.success, false);
   } finally {
     restorePath?.();
@@ -186,12 +207,10 @@ Deno.test("shipDraft accepts a PR that matches the validated SHA, branch and bas
     assertEquals(written[0].data.branch, fixture.branch);
     assertEquals(written[0].data.baseBranch, "main");
     assertEquals(written[0].data.commitSha, fixture.baseSha);
+    const ghCalls = await assertCreatedWithGh(root, fixture);
     assertEquals(
-      (await Deno.readTextFile(`${root}/gt.log`)).trim().split("\n"),
-      [
-        `track ${fixture.branch} --parent main --no-interactive`,
-        "submit -q --no-edit --no-verify --no-stack --draft",
-      ],
+      ghCalls.some((c) => c.endsWith("--fill")),
+      true,
     );
   } finally {
     restorePath?.();
@@ -199,7 +218,7 @@ Deno.test("shipDraft accepts a PR that matches the validated SHA, branch and bas
   }
 });
 
-Deno.test("shipDraft applies a caller-supplied body via gh pr edit after gt submit", async () => {
+Deno.test("shipDraft creates with the caller-supplied title and body, then refreshes it via gh pr edit", async () => {
   const root = await Deno.makeTempDir();
   let restorePath: (() => void) | undefined;
   try {
@@ -225,9 +244,12 @@ Deno.test("shipDraft applies a caller-supplied body via gh pr edit after gt subm
     assertEquals(result.dataHandles?.length, 1);
     assertEquals(test.getWrittenResources()[0].data.success, true);
 
-    // gt submit succeeded, so the gh path is: pr edit (apply body) + pr view.
-    const ghCalls = (await Deno.readTextFile(`${root}/gh.log`))
-      .trim().split("\n");
+    // Create passes --title/--body-file, then pr edit refreshes the body + pr view verifies.
+    const ghCalls = await assertCreatedWithGh(root, fixture);
+    assertEquals(
+      ghCalls.some((c) => c.includes(" --title chore: base --body-file ")),
+      true,
+    );
     const editCall = ghCalls.find((c) => c.startsWith("pr edit "));
     if (!editCall) {
       throw new Error(
@@ -292,7 +314,7 @@ Deno.test("shipDraft preflight permits update mode without gt", async () => {
   }
 });
 
-Deno.test("shipDraft create mode requires gt after shared preflight", async () => {
+Deno.test("shipDraft create mode needs only git and gh on PATH", async () => {
   const root = await Deno.makeTempDir();
   const previousPath = Deno.env.get("PATH");
   try {
@@ -307,25 +329,25 @@ Deno.test("shipDraft create mode requires gt after shared preflight", async () =
       `${bin}/git`,
       `#!/bin/sh\nexec '${realGit}' "$@"\n`,
     );
-    await Deno.writeTextFile(`${bin}/gh`, "#!/bin/sh\nexit 0\n");
+    await Deno.writeTextFile(
+      `${bin}/gh`,
+      `#!/bin/sh\nif [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"url":"https://example.test/pr/70","number":70,"state":"OPEN","isDraft":true,"headRefName":"${fixture.branch}","headRefOid":"${fixture.baseSha}","baseRefName":"main"}'; fi\n`,
+    );
     await Deno.chmod(`${bin}/git`, 0o755);
     await Deno.chmod(`${bin}/gh`, 0o755);
     Deno.env.set("PATH", bin);
     await runModelPreflight();
-    await assertRejects(
-      () =>
-        model.methods.shipDraft.execute({
-          workItem: "WORK-CREATE-NO-GT",
-          repoPath: fixture.worktree,
-          baseBranch: "main",
-          expectedHeadSha: fixture.baseSha,
-          expectedBranch: fixture.branch,
-          submissionMode: "create",
-          draft: true,
-        }, createModelTestContext({ globalArgs: {} }).context),
-      Error,
-      "create mode: gt",
-    );
+    const test = createModelTestContext({ globalArgs: {} });
+    await model.methods.shipDraft.execute({
+      workItem: "WORK-CREATE-NO-GT",
+      repoPath: fixture.worktree,
+      baseBranch: "main",
+      expectedHeadSha: fixture.baseSha,
+      expectedBranch: fixture.branch,
+      submissionMode: "create",
+      draft: true,
+    }, test.context);
+    assertEquals(test.getWrittenResources()[0].data.success, true);
   } finally {
     previousPath === undefined
       ? Deno.env.delete("PATH")
@@ -341,12 +363,10 @@ Deno.test("shipDraft create body edit failure is a persisted warning", async () 
     const fixture = await repoFixture(root);
     const bin = `${root}/bin`;
     await Deno.mkdir(bin);
-    await Deno.writeTextFile(`${bin}/gt`, "#!/bin/sh\nexit 0\n");
     await Deno.writeTextFile(
       `${bin}/gh`,
       `#!/bin/sh\nif [ "$1 $2" = "pr edit" ]; then echo edit-failed >&2; exit 1; fi\nif [ "$1 $2" = "pr view" ]; then printf '%s\\n' '{"url":"https://example.test/pr/72","number":72,"state":"OPEN","isDraft":true,"headRefName":"${fixture.branch}","headRefOid":"${fixture.baseSha}","baseRefName":"main"}'; fi\n`,
     );
-    await Deno.chmod(`${bin}/gt`, 0o755);
     await Deno.chmod(`${bin}/gh`, 0o755);
     Deno.env.set("PATH", `${bin}:${previousPath ?? ""}`);
     const test = createModelTestContext({ globalArgs: {} });
@@ -366,68 +386,6 @@ Deno.test("shipDraft create body edit failure is a persisted warning", async () 
       String(result.summary),
       "warning: PR body not applied: edit-failed",
     );
-  } finally {
-    previousPath === undefined
-      ? Deno.env.delete("PATH")
-      : Deno.env.set("PATH", previousPath);
-    await Deno.remove(root, { recursive: true });
-  }
-});
-
-Deno.test("shipDraft falls back to gh when gt track fails (local parent not in history)", async () => {
-  const root = await Deno.makeTempDir();
-  const previousPath = Deno.env.get("PATH");
-  try {
-    const fixture = await repoFixture(root);
-    const bin = `${root}/bin`;
-    await Deno.mkdir(bin);
-    // gt track FAILS (exit 1) — simulates the feature being rebased onto the
-    // REMOTE base while the local <base> branch diverged, so `gt track --parent
-    // <local>` reports "<base> is not in the history of <branch>".
-    await Deno.writeTextFile(
-      `${bin}/gt`,
-      `#!/bin/sh
-printf '%s\\n' "$*" >> '${root}/gt.log'
-if [ "$1" = "track" ]; then
-  echo "ERROR: main is not in the history of ${fixture.branch}." 1>&2
-  exit 1
-fi
-exit 0
-`,
-    );
-    // gh pr create succeeds; gh pr view returns the matching draft PR.
-    await Deno.writeTextFile(
-      `${bin}/gh`,
-      `#!/bin/sh
-printf '%s\\n' "$*" >> '${root}/gh.log'
-if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
-  printf '%s\\n' '{"url":"https://example.test/pr/12","number":12,"state":"OPEN","isDraft":true,"headRefName":"${fixture.branch}","headRefOid":"${fixture.baseSha}","baseRefName":"main"}'
-fi
-`,
-    );
-    await Deno.chmod(`${bin}/gt`, 0o755);
-    await Deno.chmod(`${bin}/gh`, 0o755);
-    Deno.env.set("PATH", `${bin}:${previousPath ?? ""}`);
-    const test = createModelTestContext({ globalArgs: {} });
-
-    const result = await model.methods.shipDraft.execute({
-      workItem: "WORK-203",
-      repoPath: fixture.worktree,
-      baseBranch: "main",
-      expectedHeadSha: fixture.baseSha,
-      expectedBranch: fixture.branch,
-      draft: true,
-    }, test.context);
-
-    // Despite gt track failing, the gh fallback created + verified the draft PR.
-    assertEquals(result.dataHandles?.length, 1);
-    const written = test.getWrittenResources();
-    assertEquals(written[0].data.success, true);
-    assertEquals(written[0].data.prNumber, 12);
-    const ghCalls = (await Deno.readTextFile(`${root}/gh.log`)).trim().split(
-      "\n",
-    );
-    assertEquals(ghCalls.some((c) => c.startsWith("pr create ")), true);
   } finally {
     previousPath === undefined
       ? Deno.env.delete("PATH")

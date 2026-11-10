@@ -24,8 +24,11 @@
  * @module graphite_draft_submit
  *
  * A standalone swamp model that submits an already-validated Git commit as a
- * **draft** GitHub pull request using the Graphite CLI (`gt`) and independently
- * verifies the result with the GitHub CLI (`gh`).
+ * **draft** GitHub pull request (`git push` + `gh pr create --draft`) and
+ * independently verifies the result with the GitHub CLI (`gh`). It no longer
+ * uses Graphite: CompanyCam retired Graphite for GitHub's native stacked PRs,
+ * and a single draft PR needs no stack tooling. The type keeps its historical
+ * name so existing model instances stay valid.
  *
  * The model is deliberately conservative. It never mutates the working tree,
  * never amends or rewrites the commit, and refuses to submit unless the checkout
@@ -35,7 +38,7 @@
  * - the worktree must be clean (`git status --porcelain` empty);
  * - `HEAD` must equal `expectedHeadSha`.
  *
- * After `gt track` + `gt submit --draft`, it queries `gh pr view` and requires
+ * After pushing the branch and creating the draft PR, it queries `gh pr view` and requires
  * the returned pull request to point at the validated SHA, branch and base, and
  * to be a draft. Any mismatch is recorded on the persisted `pullRequest`
  * resource (`success: false`) and the method throws, so a bad submission never
@@ -43,8 +46,8 @@
  *
  * The base branch is configurable per invocation and defaults to `main`.
  *
- * Prerequisites on the host running the method: `git`, `gt` (Graphite) and `gh`
- * (GitHub CLI, authenticated) all on `PATH`. Declared as model checks.
+ * Prerequisites on the host running the method: `git` and `gh` (GitHub CLI,
+ * authenticated) on `PATH`. Declared as model checks.
  */
 
 import { z } from "npm:zod@4";
@@ -120,7 +123,7 @@ export const PullRequestSchema: z.ZodObject<{
 
 /**
  * The subset of `gh pr view --json` fields this model reads to independently
- * verify the pull request Graphite created.
+ * verify the pull request that was created.
  */
 export const GitHubPullRequestSchema: z.ZodObject<{
   url: z.ZodString;
@@ -166,7 +169,7 @@ export type RuntimeContext =
 
 /**
  * Run an external command in `cwd`, capturing stdout/stderr as trimmed strings.
- * A thin wrapper over `Deno.Command` used for all `git`, `gt` and `gh` calls.
+ * A thin wrapper over `Deno.Command` used for all `git` and `gh` calls.
  */
 export async function runCommand(
   command: string[],
@@ -189,7 +192,7 @@ export async function runCommand(
 
 /**
  * Return `true` if an executable named `name` exists as a file on any `PATH`
- * entry. Used by the model checks to verify `git`, `gt` and `gh` are installed.
+ * entry. Used by the model checks to verify `git` and `gh` are installed.
  */
 export async function commandAvailable(name: string): Promise<boolean> {
   for (const directory of (Deno.env.get("PATH") ?? "").split(":")) {
@@ -248,7 +251,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
   draft: z.literal(true).default(true),
   // Optional pull-request title and body. When `body` is provided, the caller
   // owns the description (e.g. a house-style PR narrative generated upstream):
-  // the PR is opened with `--title`/`--body` instead of Graphite/gh `--fill`,
+  // the PR is opened with `--title`/`--body` instead of gh `--fill`,
   // and an already-open PR has its body refreshed via `gh pr edit`. When
   // omitted, submission falls back to `--fill` (the commit message) exactly as
   // before, so existing callers are unaffected. `title` defaults to the commit
@@ -259,7 +262,7 @@ export const ShipDraftArgsSchema: z.ZodObject<{
 
 /**
  * The swamp model. Exposes a single method, `shipDraft`, which submits a
- * validated commit as a draft GitHub pull request via Graphite and verifies it
+ * validated commit as a draft GitHub pull request with git and gh and verifies it
  * independently through the GitHub CLI. Declares checks for the required CLIs.
  */
 export const model = {
@@ -285,8 +288,7 @@ export const model = {
           : { pass: false, errors: ["Missing required tool: git"] },
     },
     "submission-tools-available": {
-      description:
-        "Verify the shared GitHub CLI dependency before submission; create mode checks Graphite immediately before its create path",
+      description: "Verify the GitHub CLI dependency before submission",
       labels: ["dependency"],
       appliesTo: ["shipDraft"],
       execute: async (): Promise<{ pass: boolean; errors?: string[] }> => {
@@ -304,7 +306,7 @@ export const model = {
   methods: {
     shipDraft: {
       description:
-        "Submit an unchanged validated commit through Graphite and require a discoverable draft GitHub pull request that points at the validated SHA, branch and base",
+        "Push an unchanged validated commit and open (or reuse) a draft GitHub pull request, then require it to point at the validated SHA, branch and base",
       arguments: ShipDraftArgsSchema,
       execute: async (
         args: {
@@ -369,13 +371,6 @@ export const model = {
           throw new Error(
             `refusing to submit invalid base branch ${expectedBase}`,
           );
-        }
-
-        // Update mode deliberately has no Graphite dependency. Create mode
-        // checks its conditional dependency before allocating temporary files
-        // or performing any submission side effect.
-        if (submissionMode === "create" && !await commandAvailable("gt")) {
-          throw new Error("Missing required tool for create mode: gt");
         }
 
         // When the caller supplies a body, persist it to a temp file so it
@@ -446,51 +441,11 @@ export const model = {
             }
           }
 
-          const track = submissionMode === "create"
-            ? await runCommand(
-              [
-                "gt",
-                "track",
-                branch,
-                "--parent",
-                expectedBase,
-                "--no-interactive",
-              ],
-              args.repoPath,
-            )
-            : { success: false, stdout: "", stderr: "", code: 1 };
-          // `--no-stack` narrows the submit to THIS branch only: it does not
-          // submit (or force-push) the parent/ancestors. Critical when the parent
-          // was `git fetch`-ed rather than gt-created (e.g. stacking on an unmerged
-          // upstream branch): a plain `gt submit` defaults to `--stack`, which
-          // trips Graphite's "fetched-then-tracked" guard and, with `--force`,
-          // would overwrite the shared parent remote — never do that.
-          const submitCommand = [
-            "gt",
-            "submit",
-            "-q",
-            "--no-edit",
-            "--no-verify",
-            "--no-stack",
-          ];
-          submitCommand.push("--draft");
-          const submit = submissionMode === "create" && track.success
-            ? await runCommand(submitCommand, args.repoPath)
-            : { success: false, stdout: "", stderr: "" };
-
-          // Fallback: when Graphite cannot submit non-interactively, create the
-          // draft PR directly with gh. This fires in TWO cases:
-          //   1. `gt track` succeeded but `gt submit` failed (the classic
-          //      "fetched-then-tracked parent" guard on a git-fetched base).
-          //   2. `gt track` FAILED because the local parent branch is not in the
-          //      feature's history — e.g. the feature was rebased onto the REMOTE
-          //      base (origin/<base>) while the local <base> branch diverged. gh
-          //      diffs against the remote `expectedBase` directly, so it does not
-          //      need Graphite's local-branch tracking at all.
-          // In both cases gh pushes ONLY this branch and opens a draft PR against
-          // the exact remote base — it never touches the parent branch. The gh pr
-          // view verification below then applies to either path.
-          let ghFallback = { success: false, stderr: "", stdout: "" };
+          // Create pushes ONLY this branch (never its parent) and opens a draft
+          // PR against the exact remote base; update force-pushes with a lease
+          // pinned to the existing PR head. The gh pr view verification below
+          // applies to both.
+          let submission = { success: false, stderr: "", stdout: "" };
           if (submissionMode === "update") {
             if (updatePr!.headRefOid !== args.expectedHeadSha) {
               const push = await runCommand([
@@ -508,8 +463,8 @@ export const model = {
                 );
               }
             }
-            ghFallback = { success: true, stderr: "", stdout: "" };
-          } else if (!submit.success) {
+            submission = { success: true, stderr: "", stdout: "" };
+          } else {
             const pushArgs = ["git", "push", "origin", `${branch}:${branch}`];
             const push = await runCommand(
               pushArgs,
@@ -532,35 +487,33 @@ export const model = {
               } else {
                 createArgs.push("--fill");
               }
-              ghFallback = await runCommand(createArgs, args.repoPath);
+              submission = await runCommand(createArgs, args.repoPath);
               // Idempotent: if a PR for this branch already exists (e.g. a prior
               // interrupted submit), that is not a failure — the `gh pr view`
               // verification below confirms the existing PR points at the exact
               // validated SHA/base and is a draft. Treat "already exists" as
               // submitted.
               if (
-                !ghFallback.success &&
-                /already exists/i.test(ghFallback.stderr + ghFallback.stdout)
+                !submission.success &&
+                /already exists/i.test(submission.stderr + submission.stdout)
               ) {
-                ghFallback = { success: true, stderr: "", stdout: "" };
+                submission = { success: true, stderr: "", stdout: "" };
               }
             } else {
-              ghFallback = {
+              submission = {
                 success: false,
                 stderr: `git push failed: ${push.stderr}`,
                 stdout: "",
               };
             }
           }
-          const submitted = submit.success || ghFallback.success;
+          const submitted = submission.success;
           const prSelector = updatePr ? String(updatePr.number) : branch;
 
           // Apply the caller-supplied body to the resulting PR whenever one was
-          // provided. This covers the `gt submit` path (which has no body option
-          // and would otherwise carry Graphite's --fill body) and the idempotent
-          // "already exists" case (whose PR may hold a stale/--fill body). The
-          // create path already set the body, so this is an idempotent refresh
-          // there. Best-effort: a failed edit does not fail submission, but is
+          // provided. This covers update mode and the idempotent "already
+          // exists" case (whose PR may hold a stale/--fill body). The create
+          // path already set the body, so this is an idempotent refresh there. Best-effort: a failed edit does not fail submission, but is
           // surfaced in the persisted summary below.
           let bodyApplyError: string | null = null;
           if (submitted && bodyFile) {
@@ -610,19 +563,11 @@ export const model = {
           if (bodyApplyError && submissionMode === "update") {
             errors.push(`could not apply PR body: ${bodyApplyError}`);
           }
-          // Only a failure to SUBMIT is an error. A failed `gt track` is not
-          // itself fatal when the gh fallback then created/verified the draft PR
-          // (submitted === true) — e.g. the feature was rebased onto the remote
-          // base while the local base branch diverged, so Graphite could not track
-          // the local parent but gh submits against the remote base fine.
           if (!submitted) {
             errors.push(
-              (track.success
-                ? `gt submit failed: ${submit.stderr || submit.stdout}`
-                : `gt track failed: ${track.stderr || track.stdout}`) +
-                (ghFallback.stderr
-                  ? ` (gh fallback also failed: ${ghFallback.stderr})`
-                  : ""),
+              `draft submission failed: ${
+                submission.stderr || submission.stdout
+              }`,
             );
           }
           if (!prInfo) {

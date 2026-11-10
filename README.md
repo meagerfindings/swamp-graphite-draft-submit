@@ -1,7 +1,7 @@
 # swamp-graphite-draft-submit
 
 [swamp](https://swamp.club) extension `@mgreten/graphite-draft-submit` — submit
-a validated Git commit as a draft GitHub pull request via Graphite, with
+a validated Git commit as a draft GitHub pull request with git and `gh`, with
 independent GitHub-side verification.
 
 📖 **Extension documentation:** [extensions/models/README.md](extensions/models/README.md)
